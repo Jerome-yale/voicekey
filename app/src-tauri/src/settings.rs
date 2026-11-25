@@ -128,9 +128,6 @@ pub enum PickPanelStart {
     Remember,
 }
 
-// 老配置没有此字段：升级后沿用官方版每次展开的行为。新安装由 Settings::default 决定。
-fn legacy_pick_panel_start() -> PickPanelStart { PickPanelStart::Expanded }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
@@ -148,7 +145,6 @@ pub struct Settings {
     /// 多渠道模式下同时识别的渠道（至少 2 个）
     pub multi: Vec<Channel>,
     /// 仅在新多渠道会话开始时读取，不强制改变本轮的布局。
-    #[serde(default = "legacy_pick_panel_start")]
     pub pick_panel_start: PickPanelStart,
     /// 最近一次手动收展；自动上屏或取消后隐藏窗口不修改它。
     pick_panel_last_expanded: bool,
@@ -320,15 +316,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn existing_install_keeps_expanded_start_while_a_new_install_remembers() {
-        let old: Settings = serde_json::from_str(r#"{"channel":"all","silenceStop":false}"#).unwrap();
-        assert_eq!(old.pick_panel_start, PickPanelStart::Expanded);
-        assert!(old.pick_starts_expanded());
-        assert_eq!(old.channel, Channel::All);
-        assert!(!old.silence_stop);
-        for s in [Settings::default(), serde_json::from_str(r#"{"pickPanelStart":"future"}"#).unwrap()] {
+    fn legacy_settings_remember_layout_starting_collapsed() {
+        for json in [r#"{"channel":"all","silenceStop":false}"#, r#"{"channel":"all","silenceStop":false,"pickPanelStart":"future"}"#] {
+            let s: Settings = serde_json::from_str(json).unwrap();
             assert_eq!(s.pick_panel_start, PickPanelStart::Remember);
             assert!(!s.pick_starts_expanded());
+            assert_eq!(s.channel, Channel::All);
+            assert!(!s.silence_stop);
         }
     }
 

@@ -60,7 +60,7 @@ export interface Model {
   finalized?: FinalizedRow | null; selFinal?: boolean; history?: HistoryView | null;
 }
 
-export interface PickModel extends Model { session: number; expanded: boolean }
+export interface PickModel extends Model { session: number; expanded: boolean; elapsedMs: number; finishing: boolean }
 
 export const call = invoke;
 export const previewSound = (id: string) => call("preview_sound", { id });

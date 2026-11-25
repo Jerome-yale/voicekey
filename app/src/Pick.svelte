@@ -4,7 +4,7 @@
   import ChIcon from "./lib/ChIcon.svelte";
   import Wave from "./lib/Wave.svelte";
 
-  const empty = (session = 0): PickModel => ({ session, expanded: false, recording: false, rows: [], sel: 0 });
+  const empty = (session = 0): PickModel => ({ session, expanded: false, recording: false, finishing: false, elapsedMs: 0, rows: [], sel: 0 });
   let model = $state<PickModel>(empty());
   const action = (name: string, args: Record<string, unknown> = {}) => call(name, { session: model.session, ...args });
   const expand = (expanded: boolean) => action("pick_expand", { expanded });
@@ -18,7 +18,7 @@
   const waiting = $derived(model.rows.filter((r) => r.state === "wait" || r.state === "listen").length);
   const done = $derived(model.rows.filter((r) => r.state === "final").length);
   const participating = $derived(model.rows.filter((r) => r.state !== "skip").length);
-  const phase = $derived(!model.rows.length ? "准备中" : model.recording ? "录音中" :
+  const phase = $derived(!model.rows.length ? "准备中" : model.finishing ? "收尾中" : model.recording ? "录音中" :
     model.jev === "busy" ? "评选中" : model.finalized?.state === "busy" ? "定稿中" :
     model.jev === "failed" || model.finalized?.state === "failed" ? (done ? "待选择" : "无结果") :
     waiting ? "识别中" : done ? "待选择" : "无结果");
@@ -27,6 +27,70 @@
   const count = $derived(model.history ? model.history.items.length : model.rows.length);
   const lines = $derived(count <= 2 ? 8 : count === 3 ? 5 : 4);
   const streaming = new Set<string>();
+
+  let elapsedMs = $state(0);
+  let sampledAt = 0;
+  const recording = $derived(model.recording);
+  const duration = $derived.by(() => {
+    const seconds = Math.floor(elapsedMs / 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes >= 60 ? `${Math.floor(minutes / 60)}:` : ""}${pad(minutes % 60)}:${pad(seconds % 60)}`;
+  });
+  $effect(() => {
+    if (!recording) return;
+    const timer = window.setInterval(() => { elapsedMs = model.elapsedMs + performance.now() - sampledAt; }, 150);
+    return () => window.clearInterval(timer);
+  });
+
+  // 保留按下时的抓取点。超过点击容差才移动，每帧至多发送一次。
+  function dragSurface(node: HTMLElement) {
+    let press: { id: number; x: number; y: number; grabX: number; grabY: number; session: number } | null = null;
+    let frame = 0;
+    let suppressClick = false;
+    let pressSession = 0;
+    function down(e: PointerEvent) {
+      if (e.button !== 0 || !e.isPrimary || !(e.target instanceof Element)) return;
+      const button = e.target.closest("button");
+      if (button && button !== node) return;
+      pressSession = model.session;
+      press = { id: e.pointerId, x: e.screenX, y: e.screenY, grabX: e.clientX, grabY: e.clientY, session: pressSession };
+      suppressClick = false;
+      node.setPointerCapture(e.pointerId);
+    }
+    function sendPosition() {
+      frame = 0;
+      if (press && press.session === model.session) void action("pick_drag", { grabX: press.grabX, grabY: press.grabY });
+    }
+    function move(e: PointerEvent) {
+      if (!press || press.id !== e.pointerId || !(e.buttons & 1)) return;
+      if (!suppressClick && Math.hypot(e.screenX - press.x, e.screenY - press.y) < 5) return;
+      suppressClick = true;
+      if (!frame) frame = window.requestAnimationFrame(sendPosition);
+    }
+    function end(e: PointerEvent) {
+      if (press?.id !== e.pointerId) return;
+      window.cancelAnimationFrame(frame);
+      frame = 0;
+      if (e.type === "pointerup" && suppressClick) sendPosition();
+      press = null;
+    }
+    function click(e: MouseEvent) {
+      if (e.detail && (suppressClick || pressSession !== model.session) && node.matches("button")) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    }
+    const events = new AbortController();
+    const options = { signal: events.signal };
+    node.addEventListener("pointerdown", down, options);
+    node.addEventListener("pointermove", move, options);
+    node.addEventListener("pointerup", end, options);
+    node.addEventListener("pointercancel", end, options);
+    node.addEventListener("lostpointercapture", end, options);
+    node.addEventListener("click", click, { ...options, capture: true });
+    return { destroy() { window.cancelAnimationFrame(frame); events.abort(); } };
+  }
 
   let reportedHeight = 0;
   function receive(m: PickModel) {
@@ -46,6 +110,8 @@
         finals.delete(r.channel);
       }
     }
+    sampledAt = performance.now();
+    elapsedMs = m.elapsedMs;
     model = m;
     report();
   }
@@ -125,19 +191,20 @@
 {/snippet}
 
 {#if !model.expanded}
-  <button type="button" class="chip" class:listening={model.recording} class:attention={phase === "待选择" || phase === "无结果"}
-    aria-label={`展开候选：${phase}，${participating} 路`} aria-expanded="false" title="展开候选，不停止录音"
+  <button type="button" class="chip" use:dragSurface class:listening={model.recording} class:attention={phase === "待选择" || phase === "无结果"}
+    aria-label={`展开候选：${phase}，录音时长 ${duration}，${participating} 路`} aria-expanded="false" title="单击展开，按住拖动"
     disabled={!model.rows.length} onclick={() => expand(true)}>
-    <span class="signal" aria-hidden="true"></span><b>{phase}</b><span class="detail">{detail}</span>
+    <span class="signal" aria-hidden="true"></span><b>{phase}</b><span class="duration">{duration}</span><span class="detail">{detail}</span>
     <svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12"><path d="m4.5 2.5 3.5 3.5-3.5 3.5" /></svg>
   </button>
 {:else}
 <div class="pick" bind:this={root} style:--lines={lines}>
   {#if model.history}
   {@const h = model.history}
-  <div class="hd">
+  <div class="hd" use:dragSurface title="按住标题栏拖动">
     <span class="htitle">识别历史</span>
     <span class="hsub">{h.enabled ? `最近 ${h.items.length} 条` : ""}</span>
+    <span class="duration" title="录音时长">{duration}</span>
     <button class="close" title="返回候选（Tab / Esc）" aria-label="返回候选" onclick={() => action("pick_key", { key: "Escape" })}>
       <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
     </button>
@@ -162,11 +229,11 @@
     {@render foldButton()}
   </div>
   {:else}
-  <div class="hd">
+  <div class="hd" use:dragSurface title="按住标题栏拖动">
     {#if model.recording}<span class="rec"></span>{/if}
     <div class="wave"><Wave level={model.recording ? level : 0} idle={!model.recording} height={26} /></div>
     <span class="state">
-      {#if model.recording}录音中
+      {#if model.recording}{model.finishing ? "收尾中" : "录音中"}
       {:else if model.finalized?.state === "busy"}<span class="spinner"></span>LLM 融合定稿中 · 可手选
       {:else if model.finalized?.state === "failed"}<span class="err">LLM 定稿失败{model.finalized.note ? `，${model.finalized.note}` : "，请手动选择"}</span>
       {:else if model.finalized?.state === "skipped"}<span class="ok">● 已省去 LLM · 按回车上屏</span>
@@ -176,6 +243,7 @@
       {:else if waiting}<span class="spinner"></span>定稿中 {done}/{model.rows.length}
       {:else}<span class="ok">● 全部完成</span>{/if}
     </span>
+    <span class="duration" title="录音时长">{duration}</span>
     <button class="close" title="关闭（Esc）" aria-label="关闭" onclick={() => action("pick_key", { key: "Escape" })}>
       <svg viewBox="0 0 12 12" width="10" height="10"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" /></svg>
     </button>
@@ -256,7 +324,10 @@
 {/if}
 
 <style>
-  .chip { width: min(100vw, 152px); height: min(100vh, 34px); display: flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--fg); cursor: pointer; white-space: nowrap; }
+  .chip { width: min(100vw, 186px); height: min(100vh, 34px); display: flex; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--fg); white-space: nowrap; }
+  .chip, .hd { cursor: grab; touch-action: none; user-select: none; }
+  .chip:active, .hd:active { cursor: grabbing; }
+  .duration { flex: none; color: var(--fg2); font-size: 12px; font-variant-numeric: tabular-nums; }
   .chip b { font-size: 12.5px; font-weight: 600; }
   .chip .detail { flex: 1; color: var(--fg2); font-size: 11.5px; text-align: right; font-variant-numeric: tabular-nums; }
   .signal { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--accent); }

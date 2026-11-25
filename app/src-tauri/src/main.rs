@@ -242,6 +242,14 @@ fn pick_ready(app: AppHandle) {
 }
 
 #[tauri::command]
+fn pick_drag(window: tauri::WebviewWindow, session: u64, grab_x: f64, grab_y: f64) {
+    if window.label() != "pick" || !grab_x.is_finite() || !grab_y.is_finite() { return; }
+    if let Ok(p) = window.cursor_position() {
+        send(window.app_handle(), Msg::PickUi { session, action: PickAction::Drag { cursor: (p.x, p.y), grab: (grab_x, grab_y) } });
+    }
+}
+
+#[tauri::command]
 fn pick_expand(app: AppHandle, session: u64, expanded: bool) {
     send(&app, Msg::PickUi { session, action: PickAction::Expand(expanded) });
 }
@@ -352,9 +360,8 @@ fn main() {
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
-            record_shortcut_input,
-            get_state, set_settings, perm_status, perm_action, microphones, record_shortcut,
-            pick_ready, pick_expand, pick_choose, pick_choose_final, pick_key, pick_resize, compare_toggle, meter, open_url, model_download,
+            get_state, set_settings, perm_status, perm_action, microphones, record_shortcut, record_shortcut_input,
+            pick_ready, pick_drag, pick_expand, pick_choose, pick_choose_final, pick_key, pick_resize, compare_toggle, meter, open_url, model_download,
             update_check, update_install, jev_test, llm_test, llm_check_url, llm_preview_prompt,
             preview_sound, list_sounds,
             account_save, account_login, account_logout, get_recognition_history, clear_recognition_history

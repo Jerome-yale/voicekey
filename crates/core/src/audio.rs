@@ -84,6 +84,9 @@ pub struct Framer {
     rs: Option<FftFixedIn<f32>>,
     inbuf: Vec<f32>,
     pending: Vec<i16>,
+    rate: u32,
+    input_samples: u64,
+    emitted_samples: u64,
 }
 
 impl Framer {
@@ -93,10 +96,11 @@ impl Framer {
         } else {
             Some(FftFixedIn::new(rate as usize, 16000, (rate / 100) as usize, 1, 1)?)
         };
-        Ok(Self { rs, inbuf: Vec::new(), pending: Vec::new() })
+        Ok(Self { rs, inbuf: Vec::new(), pending: Vec::new(), rate, input_samples: 0, emitted_samples: 0 })
     }
 
     pub fn push(&mut self, mono: &[f32]) -> Vec<Vec<i16>> {
+        self.input_samples += mono.len() as u64;
         match &mut self.rs {
             None => self.pending.extend(mono.iter().map(|&s| to_i16(s))),
             Some(rs) => {
@@ -113,10 +117,35 @@ impl Framer {
                 }
             }
         }
+        self.take_frames()
+    }
+
+    fn take_frames(&mut self) -> Vec<Vec<i16>> {
         let mut frames = Vec::new();
         while self.pending.len() >= FRAME {
             frames.push(self.pending.drain(..FRAME).collect());
         }
+        self.emitted_samples += (frames.len() * FRAME) as u64;
+        frames
+    }
+
+    /// 送完真实输入以及 FFT 的群延迟，再将最后不足 20ms 的一帧补零。
+    fn finish(&mut self) -> Vec<Vec<i16>> {
+        if let Some(mut rs) = self.rs.take().filter(|_| self.input_samples > 0) {
+            let expected = (self.input_samples * 16_000).div_ceil(u64::from(self.rate)) + rs.output_delay() as u64;
+            let mut left = expected.saturating_sub(self.emitted_samples + self.pending.len() as u64);
+            let tail = std::mem::take(&mut self.inbuf);
+            let channels = [tail.as_slice()];
+            let mut input = (!tail.is_empty()).then_some(channels.as_slice());
+            while left > 0 {
+                let Ok(out) = rs.process_partial(input.take(), None) else { break };
+                let take = left.min(out[0].len() as u64) as usize;
+                self.pending.extend(out[0][..take].iter().map(|&s| to_i16(s)));
+                left -= take as u64;
+            }
+        }
+        let mut frames = self.take_frames();
+        frames.extend(self.flush());
         frames
     }
 
@@ -128,6 +157,36 @@ impl Framer {
         let mut f = std::mem::take(&mut self.pending);
         f.resize(FRAME, 0);
         Some(f)
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    #[test]
+    fn stop_preserves_the_last_sound_for_native_and_resampled_microphones() {
+        for rate in [16_000, 22_050, 44_100, 48_000] {
+            for len in [1, rate / 100, rate / 50 - 1, rate / 25 + 7] {
+                let mut input = vec![0.0; len as usize];
+                let onset = input.len().saturating_sub(rate as usize / 500);
+                input[onset..].fill(0.75);
+                let mut f = Framer::new(rate).unwrap();
+                let delay = f.rs.as_ref().map_or(0, |r| r.output_delay());
+                let mut got: Vec<_> = input.chunks(67).flat_map(|v| f.push(v)).flatten().collect();
+                got.extend(f.finish().into_iter().flatten());
+                assert!(f.finish().is_empty());
+                // 连续送静音让同一重采样器自然排空，作为最后一个采样的对照。
+                let keep = (input.len() * 16_000).div_ceil(rate as usize) + delay;
+                input.resize(input.len() + rate as usize / 5, 0.0);
+                let reference: Vec<_> = Framer::new(rate).unwrap().push(&input).into_iter().flatten().collect();
+                assert_eq!(&got[..keep], &reference[..keep], "采样率 {rate}，输入 {len} 点");
+                assert!(got[..keep].iter().any(|&s| s > 1_000));
+                assert_eq!(got.len(), keep.div_ceil(FRAME) * FRAME);
+                assert!(got[keep..].iter().all(|&s| s == 0));
+            }
+            assert!(Framer::new(rate).unwrap().finish().is_empty());
+        }
     }
 }
 
@@ -304,12 +363,9 @@ impl Recorder {
             let _ = t.join();
         }
         let mut sh = self.shared.lock().unwrap();
-        if let Some(f) = sh.framer.flush() {
-            if let Some(tx) = &sh.tx {
-                let _ = tx.send(f);
-            }
+        if let Some(tx) = sh.tx.take() {
+            for frame in sh.framer.finish() { let _ = tx.send(frame); }
         }
-        sh.tx = None;
     }
 }
 
@@ -360,7 +416,7 @@ pub fn file_frames(path: &str, realtime: bool) -> Result<Audio> {
     let mono: Vec<f32> = samples.chunks(ch).map(|c| c.iter().sum::<f32>() / ch as f32).collect();
     let mut framer = Framer::new(spec.sample_rate)?;
     let mut frames = framer.push(&mono);
-    frames.extend(framer.flush());
+    frames.extend(framer.finish());
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         for f in frames {

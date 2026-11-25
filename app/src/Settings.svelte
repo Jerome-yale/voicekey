@@ -38,7 +38,7 @@
         <div class="drag" data-tauri-drag-region></div>
         <div class="brand">
           <div class="app"><Logo /></div>
-          <div><b>VoiceKey</b><small>v{app.info.version}</small></div>
+          <div><b>VoiceKey</b><small>v{app.info.version} · 自用版 R6</small></div>
         </div>
         {#each PAGES as p}
           <button class="nav" class:on={page === p.id} onclick={() => (page = p.id)}>

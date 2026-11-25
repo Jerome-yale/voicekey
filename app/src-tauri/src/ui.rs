@@ -14,14 +14,14 @@ const TRAY: &[u8] = include_bytes!("../icons/tray.png");
 const HUD_W: f64 = 680.0;
 const HUD_H: f64 = 120.0;
 const PICK_W: f64 = 520.0;
-const CHIP_W: f64 = 152.0;
+const CHIP_W: f64 = 186.0;
 const CHIP_H: f64 = 34.0;
 
 static HUD_TOKEN: AtomicU64 = AtomicU64::new(0);
 /// 候选面板锚点（统一坐标空间：macOS 逻辑点 / Windows 物理像素）
 static PICK_ANCHOR: Mutex<Option<Anchor>> = Mutex::new(None);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Area {
     x: f64,
     y: f64,
@@ -35,6 +35,8 @@ struct Anchor {
     caret: Option<(f64, f64, f64, f64)>,
     area: Area,
     secure: bool,
+    // 拖动时保存手动位置，新会话重新从输入光标定位。
+    origin: Option<(f64, f64)>,
     layout: PickLayout,
 }
 
@@ -232,12 +234,13 @@ fn pick_rect(a: &Anchor) -> (f64, f64, f64, f64) {
     let (width, height) = a.layout.size();
     let pw = cap_len(units(ar, width), ar.w, gap);
     let ph = cap_len(units(ar, height), ar.h, gap);
-    let (x, y) = match a.caret {
-        Some((cx, cy, _, chh)) => {
+    let (x, y) = match (a.origin, a.caret) {
+        (Some(pos), _) => pos,
+        (_, Some((cx, cy, _, chh))) => {
             let above = cy - ph - gap;
             (cx - units(ar, 40.0), if above >= ar.y { above } else { cy + chh + gap })
         }
-        None => (ar.x + (ar.w - pw) / 2.0, ar.y + ar.h - ph - units(ar, 120.0)),
+        (None, None) => (ar.x + (ar.w - pw) / 2.0, ar.y + ar.h - ph - units(ar, 120.0)),
     };
     let x = clamp_axis(x, ar.x + gap, ar.x + ar.w - pw - gap);
     let y = clamp_axis(y, ar.y + gap, ar.y + ar.h - ph - gap);
@@ -245,10 +248,28 @@ fn pick_rect(a: &Anchor) -> (f64, f64, f64, f64) {
     (x, y, pw / scale, ph / scale)
 }
 
-fn place_pick<R: Runtime>(w: &WebviewWindow<R>, a: &Anchor) {
+fn place_pick<R: Runtime>(w: &WebviewWindow<R>, a: &Anchor, resize: bool) {
     let (x, y, width, height) = pick_rect(a);
-    set_client(w, &a.area, width, height);
     set_pos(w, x, y);
+    if resize { set_client(w, &a.area, width, height); }
+}
+
+pub fn pick_drag<R: Runtime>(app: &AppHandle<R>, cursor: (f64, f64), grab: (f64, f64)) {
+    let Some(w) = app.get_webview_window("pick") else { return };
+    let Ok(Some(m)) = app.monitor_from_point(cursor.0, cursor.1) else { return };
+    let area = work_area(&m);
+    let k = if cfg!(target_os = "macos") { area.scale } else { 1.0 };
+    let origin = (cursor.0 / k - units(&area, grab.0), cursor.1 / k - units(&area, grab.1));
+    let (a, resize) = {
+        let mut anchor = PICK_ANCHOR.lock().unwrap();
+        let Some(a) = anchor.as_mut() else { return };
+        let resize = a.area != area;
+        if !resize && a.origin == Some(origin) { return; }
+        a.area = area;
+        a.origin = Some(origin);
+        (*a, resize)
+    };
+    place_pick(&w, &a, resize);
 }
 
 /// `f64::clamp` 在 min > max 时 panic。面板比屏幕还宽/高时上界可能小于下界。
@@ -268,7 +289,7 @@ pub fn pick_show<R: Runtime>(app: &AppHandle<R>, caret: Option<voicekey_platform
             None => return,
         },
     };
-    *PICK_ANCHOR.lock().unwrap() = Some(Anchor { caret, area, secure, layout: PickLayout::for_rows(expanded, rows) });
+    *PICK_ANCHOR.lock().unwrap() = Some(Anchor { caret, area, secure, origin: None, layout: PickLayout::for_rows(expanded, rows) });
     present_pick(app);
 }
 
@@ -282,7 +303,7 @@ fn apply_pick_layout<R: Runtime>(app: &AppHandle<R>, show: bool) {
     // 无边框窗口也受 Windows 默认最小跟踪高度限制；显式放开才能缩到胶囊的真实尺寸。
     #[cfg(windows)]
     if matches!(a.layout, PickLayout::Chip) { let _ = w.set_min_size(Some(LogicalSize::new(1.0, 1.0))); }
-    place_pick(&w, &a);
+    place_pick(&w, &a, true);
     #[cfg(target_os = "macos")]
     panel::set_keyable(&w, focus);
     if show && !w.is_visible().unwrap_or(false) { let _ = w.show(); }
@@ -307,7 +328,7 @@ pub fn pick_resize<R: Runtime>(app: &AppHandle<R>, height: f64) {
         a.layout = PickLayout::List(height);
         *a
     };
-    if let Some(w) = app.get_webview_window("pick") { place_pick(&w, &a); }
+    if let Some(w) = app.get_webview_window("pick") { place_pick(&w, &a, true); }
 }
 
 pub fn pick_hide<R: Runtime>(app: &AppHandle<R>) {
@@ -466,7 +487,7 @@ mod tests {
 
     #[test]
     fn first_native_size_matches_the_start_preference() {
-        assert_eq!(PickLayout::for_rows(false, 8).size(), (152.0, 34.0));
+        assert_eq!(PickLayout::for_rows(false, 8).size(), (186.0, 34.0));
         assert_eq!(PickLayout::for_rows(true, 8).size(), (520.0, 476.0));
     }
 
@@ -475,8 +496,8 @@ mod tests {
         for scale in [1.0, 1.25, 2.0] {
             let area = Area { x: -1920.0, y: 25.0, w: 1920.0, h: 1000.0, scale };
             for caret in [None, Some((-1920.0, 25.0, 2.0, 20.0)), Some((-10.0, 990.0, 2.0, 22.0))] {
-                let mut a = Anchor { caret, area, secure: false, layout: PickLayout::Chip };
-                for (layout, expected) in [(PickLayout::Chip, (152.0, 34.0)), (PickLayout::List(280.0), (520.0, 280.0)), (PickLayout::Chip, (152.0, 34.0))] {
+                let mut a = Anchor { caret, area, secure: false, origin: None, layout: PickLayout::Chip };
+                for (layout, expected) in [(PickLayout::Chip, (186.0, 34.0)), (PickLayout::List(280.0), (520.0, 280.0)), (PickLayout::Chip, (186.0, 34.0))] {
                     a.layout = layout;
                     let (x, y, w, h) = pick_rect(&a);
                     assert_eq!((w, h), expected);
@@ -484,6 +505,21 @@ mod tests {
                     assert!(y >= area.y && y + units(&area, h) <= area.y + area.h);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn dragged_origin_survives_layout_and_stays_inside_the_current_monitor() {
+        let area = Area { x: -1800.0, y: 24.0, w: 1800.0, h: 1000.0, scale: 1.5 };
+        let mut a = Anchor { caret: Some((-400.0, 800.0, 1.0, 20.0)), area, secure: false, origin: None, layout: PickLayout::Chip };
+        for layout in [PickLayout::Chip, PickLayout::List(280.0), PickLayout::List(420.0), PickLayout::Chip] {
+            a.layout = layout;
+            a.origin = Some((-1500.0, 160.0));
+            let (x, y, _, _) = pick_rect(&a);
+            assert_eq!((x, y), (-1500.0, 160.0));
+            a.origin = Some((-5.0, 995.0));
+            let (x, y, w, h) = pick_rect(&a);
+            assert!(x + units(&area, w) <= area.x + area.w && y + units(&area, h) <= area.y + area.h);
         }
     }
 

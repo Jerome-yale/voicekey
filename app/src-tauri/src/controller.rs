@@ -160,9 +160,10 @@ pub struct Row {
     ms: Option<u64>,
 }
 
-/// 来自候选浮窗的动作必须属于当前会话；折叠时只有展开按钮可用。
+/// 布局和拖动只作用于当前候选窗，不接管本轮评选。
 #[derive(Clone, Copy)]
 pub enum PickAction {
+    Drag { cursor: (f64, f64), grab: (f64, f64) },
     Expand(bool),
     Measure(f64),
     Choose(usize),
@@ -171,7 +172,30 @@ pub enum PickAction {
 }
 
 impl PickAction {
-    fn allowed(self, expanded: bool) -> bool { expanded || matches!(self, Self::Expand(_)) }
+    fn allowed(self, expanded: bool) -> bool { expanded || matches!(self, Self::Expand(_) | Self::Drag { .. }) }
+}
+
+/// 单调时钟只累计开麦时段，同一会话续录时跳过等待识别的时间。
+#[derive(Default)]
+struct RecordingClock {
+    recorded: Duration,
+    since: Option<Instant>,
+}
+
+impl RecordingClock {
+    fn start(&mut self, now: Instant, new_session: bool) {
+        if new_session { self.recorded = Duration::ZERO; }
+        self.since = Some(now);
+    }
+
+    fn elapsed(&self, now: Instant) -> Duration {
+        self.recorded + self.since.map_or(Duration::ZERO, |start| now.saturating_duration_since(start))
+    }
+
+    fn stop(&mut self, now: Instant) {
+        self.recorded = self.elapsed(now);
+        self.since = None;
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -179,6 +203,9 @@ struct Model<'a> {
     session: u64,
     expanded: bool,
     recording: bool,
+    #[serde(rename = "elapsedMs")]
+    elapsed_ms: u64,
+    finishing: bool,
     rows: &'a [Row],
     sel: usize,
     jev: JevState,
@@ -379,6 +406,8 @@ pub struct Ctl {
     timeout_token: u64,
     mode: Mode,
     recording: bool,
+    clock: RecordingClock,
+    tail_deadline: Option<Instant>,
     auto_stop: bool,
     heard_voice: bool,
     last_voice: Instant,
@@ -462,6 +491,8 @@ pub fn spawn(app: AppHandle, qwen: Arc<QwenEngine>, rx: UnboundedReceiver<Msg>) 
         timeout_token: 0,
         mode: Mode::Idle,
         recording: false,
+        clock: RecordingClock::default(),
+        tail_deadline: None,
         auto_stop: false,
         heard_voice: false,
         last_voice: Instant::now(),
@@ -542,7 +573,9 @@ impl Ctl {
     async fn run(mut self, mut rx: UnboundedReceiver<Msg>) {
         let mut retry = tokio::time::interval(Duration::from_secs(2));
         loop {
+            let tail_deadline = self.tail_deadline;
             tokio::select! {
+                _ = async { if let Some(d) = tail_deadline { tokio::time::sleep_until(d.into()).await; } }, if tail_deadline.is_some() => self.end(),
                 m = rx.recv() => {
                     let Some(m) = m else { break };
                     let was_idle = self.mode == Mode::Idle;
@@ -682,8 +715,12 @@ impl Ctl {
                 if self.mode == Mode::Compare {
                     return;
                 }
-                if self.recording {
-                    self.end()
+                if self.tail_deadline.is_some() {
+                    // 又明确点了一次就立即切段，旧收尾时刻不会作用于新的一段。
+                    self.end();
+                    if self.mode == Mode::Idle { self.begin(true); } else { self.resume(true); }
+                } else if self.recording {
+                    self.finish_tap();
                 } else if matches!(self.mode, Mode::Single(_) | Mode::Pick) {
                     self.resume(true)
                 } else if self.mode != Mode::Idle {
@@ -753,6 +790,7 @@ impl Ctl {
             audio
         };
 
+        self.clock.start(Instant::now(), self.mode == Mode::Idle);
         // 成功开麦（含预开麦转正）发开始音。开始音必须在压低音量之前发
         // （cometix-dictation 同序：开麦 → 播开始音 → 压音量），否则音没播完就被压掉。
         // 新会话开始：递增提示音代数，上一会话尚在排队/等待的延迟提示音全部作废；
@@ -854,6 +892,8 @@ impl Ctl {
             return;
         }
         self.recording = false;
+        self.clock.stop(Instant::now());
+        self.tail_deadline = None;
         self.auto_stop = false;
         // 先发恢复意图；若此时还在淡入/淡出，worker 会从当前实际音量平滑反向，而不是排队跑完整段动画。
         self.volume_ducking.set_active(false);
@@ -1190,7 +1230,7 @@ impl Ctl {
 
     /// 说过话后静音超过设定时长即结束；一直没开口则 8 秒后放弃。设置里关闭后只能手动结束
     fn check_silence(&mut self, level: f32) {
-        if !self.recording || !self.auto_stop || !self.settings.read().unwrap().silence_stop {
+        if !self.recording || self.tail_deadline.is_some() || !self.auto_stop || !self.settings.read().unwrap().silence_stop {
             return;
         }
         if level > 0.3 {
@@ -1209,6 +1249,12 @@ impl Ctl {
             self.heard_voice = true;
             self.last_voice = Instant::now();
         }
+    }
+
+    // 句末和点按同时发生时，给麦克风的最后几个回调留一点时间。控制器仍可立即响应取消。
+    fn finish_tap(&mut self) {
+        self.tail_deadline = Some(Instant::now() + Duration::from_millis(300));
+        if self.mode == Mode::Pick { self.emit_rows_now(); }
     }
 
     fn end(&mut self) {
@@ -1342,6 +1388,7 @@ impl Ctl {
         let expanded = self.hk.picking.load(Ordering::Relaxed);
         if !action.allowed(expanded) { return; }
         match action {
+            PickAction::Drag { cursor, grab } => ui::pick_drag(&self.app, cursor, grab),
             PickAction::Expand(on) if on != expanded => {
                 // 看一眼列表不是手选：不调用 take_manual、end 或 advance_pick。
                 self.hk.picking.store(on, Ordering::Relaxed);
@@ -1798,6 +1845,8 @@ impl Ctl {
             session: self.gen,
             expanded: self.hk.picking.load(Ordering::Relaxed),
             recording: self.recording,
+            elapsed_ms: self.clock.elapsed(self.last_emit).as_millis() as u64,
+            finishing: self.tail_deadline.is_some(),
             rows: &self.rows,
             sel: self.sel,
             jev: self.jev,
@@ -1850,9 +1899,27 @@ mod tests {
     use crate::settings::Channel;
 
     #[test]
+    fn recording_time_pauses_resumes_and_resets_for_a_new_session() {
+        let at = Instant::now();
+        let sec = Duration::from_secs;
+        let mut clock = super::RecordingClock::default();
+        clock.start(at, true);
+        clock.stop(at + sec(8));
+        assert_eq!(clock.elapsed(at + sec(20)), sec(8));
+        clock.start(at + sec(20), false);
+        assert_eq!(clock.elapsed(at + sec(25)), sec(13));
+        clock.stop(at + sec(26));
+        clock.start(at + sec(40), true);
+        assert_eq!(clock.elapsed(at + sec(41)), sec(1));
+    }
+
+    #[test]
     fn only_layout_controls_are_active_while_folded() {
         use super::{PickAction, Special};
         assert!(PickAction::Expand(true).allowed(false));
+        let drag = PickAction::Drag { cursor: (200.0, 180.0), grab: (20.0, 12.0) };
+        assert!(drag.allowed(false));
+        assert!(drag.allowed(true));
         for a in [PickAction::Choose(0), PickAction::ChooseFinal, PickAction::Key(Special::Enter), PickAction::Measure(900.0)] {
             assert!(!a.allowed(false));
             assert!(a.allowed(true));

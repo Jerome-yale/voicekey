@@ -48,9 +48,30 @@ struct Upload<'a> {
     voice_id: String,
     total: usize,
     seq: u64,
-    text: String,
-    polished: String,
+    transcript: Transcript,
     partial: &'a Partial,
+}
+
+#[derive(Default)]
+struct Transcript {
+    raw: String,
+    draft: String,
+    final_text: String,
+}
+
+impl Transcript {
+    fn update(&mut self, raw: String, polished: String, is_end: bool) {
+        if !raw.is_empty() { self.raw = raw; }
+        if !polished.is_empty() {
+            if is_end { self.final_text = polished; } else { self.draft = polished; }
+        }
+    }
+
+    fn into_text(self) -> String {
+        if !self.final_text.is_empty() { self.final_text }
+        else if !self.raw.is_empty() { self.raw }
+        else { self.draft }
+    }
 }
 
 impl Upload<'_> {
@@ -65,13 +86,9 @@ impl Upload<'_> {
             }
         };
         self.reused = false;
-        if !text.is_empty() {
-            (self.partial)(&text);
-            self.text = text;
-        }
-        if !polished.is_empty() {
-            self.polished = polished;
-        }
+        if !text.is_empty() { (self.partial)(&text); }
+        // 上传途中整理过的文本可能只覆盖前半句，不能用来提前结束定稿轮询。
+        self.transcript.update(text, polished, is_end);
         Ok(())
     }
 
@@ -106,7 +123,7 @@ impl Engine for WeTypeEngine {
         let mut up = Upload {
             c, reused,
             voice_id: uuid::Uuid::new_v4().simple().to_string(),
-            total: 0, seq: 0, text: String::new(), polished: String::new(),
+            total: 0, seq: 0, transcript: Transcript::default(),
             partial: &partial,
         };
         let mut enc = opus::Opus::new(opus::AUDIO, 64000, 9)?;
@@ -121,15 +138,40 @@ impl Engine for WeTypeEngine {
         up.upload(&packets, true).await?;
         // 松手后以空包轮询整理过的定稿，实测首轮即返回
         for _ in 0..8 {
-            if !up.polished.is_empty() {
+            if !up.transcript.final_text.is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
             up.send(None, 0, true).await?;
         }
-        let text = if up.polished.is_empty() { std::mem::take(&mut up.text) } else { std::mem::take(&mut up.polished) };
         *self.client.lock().await = Some(up.c);
-        Ok(text)
+        Ok(up.transcript.into_text())
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::Transcript;
+
+    #[test]
+    fn an_early_polished_prefix_cannot_hide_the_last_words_or_punctuation() {
+        let mut t = Transcript::default();
+        t.update("说到这里".into(), "说到这里。".into(), false);
+        t.update("说到这里还有三个字".into(), String::new(), true);
+        assert!(t.final_text.is_empty());
+        t.update(String::new(), "说到这里还有三个字？".into(), true);
+        assert_eq!(t.into_text(), "说到这里还有三个字？");
+    }
+
+    #[test]
+    fn missing_final_falls_back_to_latest_raw_then_draft() {
+        let mut t = Transcript::default();
+        t.update("完整的尾音".into(), "完整".into(), false);
+        t.update(String::new(), String::new(), true);
+        assert_eq!(t.into_text(), "完整的尾音");
+        let mut only_draft = Transcript::default();
+        only_draft.update(String::new(), "仅有的文字".into(), false);
+        assert_eq!(only_draft.into_text(), "仅有的文字");
     }
 }
 
